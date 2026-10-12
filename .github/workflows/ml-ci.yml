@@ -28,24 +28,25 @@ jobs:
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
-      - name: Show project files
-        run: |
-          pwd
-          ls -la
-          cat requirements.txt
-
       - name: Install ML dependencies
-        run: |
-          python -m pip install -r requirements.txt
-          python -m pip install joblib
-
-      - name: Verify joblib
-        run: |
-          python -m pip show joblib
-          python -c "import sys, joblib; print(sys.executable); print(joblib.__version__)"
+        run: pip install -r requirements.txt
 
       - name: Train student result model
         run: python train_model.py
 
+      - name: Check ML quality gate
+        run: python quality_gate.py
+
       - name: Run automated ML tests
         run: python -m unittest discover -v
+
+      - name: Upload validated ML artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: student-result-ml-artifacts
+          path: |
+            student_result_model.pkl
+            metrics.json
+            student_results.csv
+          if-no-files-found: error
+          retention-days: 7
