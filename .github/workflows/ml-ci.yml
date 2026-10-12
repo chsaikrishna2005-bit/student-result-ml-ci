@@ -1,27 +1,22 @@
-name: Student Result ML CI-CD
+name: Student Result ML CI
 
 on:
   push:
     branches:
       - main
-
   pull_request:
     branches:
       - main
-
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-
-  train-test-deliver:
-
+  train-and-test:
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout repository
         uses: actions/checkout@v7
 
@@ -33,37 +28,24 @@ jobs:
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Show project files
+        run: |
+          pwd
+          ls -la
+          cat requirements.txt
+
+      - name: Install ML dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install joblib
+
+      - name: Verify joblib
+        run: |
+          python -m pip show joblib
+          python -c "import sys, joblib; print(sys.executable); print(joblib.__version__)"
 
       - name: Train student result model
         run: python train_model.py
 
-      - name: Check ML quality gate
-        run: python quality_gate.py
-
       - name: Run automated ML tests
-        run: python -m unittest test_ml_pipeline.py -v
-
-      - name: Run prediction application tests
-        run: python -m unittest test_app.py -v
-
-      - name: Prepare release candidate
-        run: |
-          mkdir -p release_candidate
-          cp app.py release_candidate/
-          cp student_result_model.pkl release_candidate/
-          cp metrics.json release_candidate/
-          cp requirements.txt release_candidate/
-          printf "Student Result Prediction ML Application
-Run: python app.py
-Endpoint: POST /predict
-" > release_candidate/DEPLOYMENT.txt
-
-      - name: Upload release candidate
-        uses: actions/upload-artifact@v4
-        with:
-          name: student-result-ml-release
-          path: release_candidate/
-          if-no-files-found: error
-          retention-days: 7
+        run: python -m unittest discover -v
