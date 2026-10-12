@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - main
+
   pull_request:
     branches:
       - main
+
   workflow_dispatch:
 
 permissions:
@@ -29,17 +31,13 @@ jobs:
         run: python -m pip install --upgrade pip
 
       - name: Install ML dependencies
-        run: python -m pip install -r requirements.txt
-
-      - name: Verify installed dependencies
-        run: |
-          python --version
-          python -m pip --version
-          python -m pip show joblib
-          python -c "import joblib; print('joblib version:', joblib.__version__)"
+        run: pip install -r requirements.txt
 
       - name: Train student result model
         run: python train_model.py
+
+      - name: Check ML quality gate
+        run: python quality_gate.py
 
       - name: Run automated ML tests
         run: python -m unittest discover -v
