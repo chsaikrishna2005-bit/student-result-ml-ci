@@ -1,13 +1,23 @@
 
 from pathlib import Path
 import logging
+import os
 import sys
 import time
 import uuid
 
 import joblib
 import pandas as pd
-from flask import Flask, jsonify, request, g
+
+from flask import Flask, jsonify, request, g, Response
+
+from prometheus_client import (
+    Counter,
+    Histogram,
+    Gauge,
+    generate_latest,
+    CONTENT_TYPE_LATEST,
+)
 
 # --------------------------------------------------
 # LOGGING CONFIGURATION
@@ -24,6 +34,35 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("student-result-api")
+
+# --------------------------------------------------
+# PROMETHEUS METRICS
+# --------------------------------------------------
+
+HTTP_REQUESTS = Counter(
+    "student_api_http_requests_total",
+    "Total HTTP requests received by the Student Result Prediction API",
+    ["method", "path", "status"]
+)
+
+HTTP_LATENCY = Histogram(
+    "student_api_http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["method", "path"]
+)
+
+PREDICTIONS = Counter(
+    "student_api_predictions_total",
+    "Total Student Result Prediction attempts",
+    ["result"]
+)
+
+MODEL_LOADED = Gauge(
+    "student_api_model_loaded",
+    "Whether the Student Result Prediction model is loaded"
+)
+
+MODEL_LOADED.set(0)
 
 # --------------------------------------------------
 # FLASK APPLICATION CONFIGURATION
@@ -44,34 +83,48 @@ FEATURES = [
 ]
 
 # --------------------------------------------------
-# REQUEST LOGGING MIDDLEWARE
+# REQUEST LOGGING AND METRICS MIDDLEWARE
 # --------------------------------------------------
 
 @app.before_request
 def start_request_logging():
-    """Assign request ID and record request start time."""
-
     g.request_id = request.headers.get(
         "X-Request-ID",
         str(uuid.uuid4())
     )
-
     g.start_time = time.perf_counter()
 
 
 @app.after_request
 def finish_request_logging(response):
-    """Log HTTP request details and response time."""
 
-    duration_ms = (
-        time.perf_counter() - g.start_time
-    ) * 1000
+    duration = time.perf_counter() - g.start_time
+    duration_ms = duration * 1000
 
     response.headers["X-Request-ID"] = g.request_id
 
+    path = request.path
+    method = request.method
+    status = response.status_code
+
+    # Do not include Prometheus scrape requests
+    # in application traffic metrics.
+    if path != "/metrics":
+
+        HTTP_REQUESTS.labels(
+            method=method,
+            path=path,
+            status=str(status)
+        ).inc()
+
+        HTTP_LATENCY.labels(
+            method=method,
+            path=path
+        ).observe(duration)
+
     log_level = (
         logging.WARNING
-        if response.status_code >= 400
+        if status >= 400
         else logging.INFO
     )
 
@@ -82,9 +135,9 @@ def finish_request_logging(response):
             "method=%s path=%s status=%s duration_ms=%.2f"
         ),
         g.request_id,
-        request.method,
-        request.path,
-        response.status_code,
+        method,
+        path,
+        status,
         duration_ms,
     )
 
@@ -96,9 +149,11 @@ def finish_request_logging(response):
 # --------------------------------------------------
 
 def load_model():
-    """Load the trained student result prediction model."""
 
     if not MODEL_PATH.exists():
+
+        MODEL_LOADED.set(0)
+
         logger.error(
             "event=model_load_failed model_file=%s",
             MODEL_PATH.name,
@@ -110,7 +165,10 @@ def load_model():
         )
 
     try:
+
         model = joblib.load(MODEL_PATH)
+
+        MODEL_LOADED.set(1)
 
         logger.info(
             "event=model_loaded model_file=%s",
@@ -120,10 +178,14 @@ def load_model():
         return model
 
     except Exception:
+
+        MODEL_LOADED.set(0)
+
         logger.exception(
             "event=model_load_failed model_file=%s",
             MODEL_PATH.name,
         )
+
         raise
 
 
@@ -133,7 +195,6 @@ def load_model():
 
 @app.get("/")
 def home():
-    """Return basic service information."""
 
     logger.info("event=home_endpoint_accessed")
 
@@ -144,12 +205,11 @@ def home():
 
 
 # --------------------------------------------------
-# HEALTH CHECK ENDPOINT
+# HEALTH CHECK
 # --------------------------------------------------
 
 @app.get("/health")
 def health_check():
-    """Health endpoint used by Docker and GitHub Actions."""
 
     logger.info("event=health_check_success")
 
@@ -160,17 +220,29 @@ def health_check():
 
 
 # --------------------------------------------------
+# PROMETHEUS METRICS ENDPOINT
+# --------------------------------------------------
+
+@app.get("/metrics")
+def metrics():
+
+    return Response(
+        generate_latest(),
+        mimetype=CONTENT_TYPE_LATEST
+    )
+
+
+# --------------------------------------------------
 # STUDENT RESULT PREDICTION
 # --------------------------------------------------
 
 @app.post("/predict")
 def predict():
-    """Predict PASS or FAIL from student features."""
 
     data = request.get_json(silent=True)
 
-    # Validate JSON body
     if not isinstance(data, dict):
+
         logger.warning(
             "event=validation_error reason=invalid_json"
         )
@@ -179,13 +251,13 @@ def predict():
             "error": "A valid JSON object is required",
         }), 400
 
-    # Check required features
     missing_fields = [
         feature for feature in FEATURES
         if feature not in data
     ]
 
     if missing_fields:
+
         logger.warning(
             "event=validation_error missing_fields=%s",
             missing_fields,
@@ -197,8 +269,7 @@ def predict():
         }), 400
 
     try:
-        # Log feature names only.
-        # Do not log actual student input values.
+
         logger.info(
             "event=prediction_request feature_names=%s",
             FEATURES,
@@ -209,8 +280,8 @@ def predict():
             for feature in FEATURES
         }])
 
-        # Validate numeric inputs
         for feature in FEATURES:
+
             sample[feature] = pd.to_numeric(
                 sample[feature],
                 errors="raise"
@@ -228,6 +299,10 @@ def predict():
             else "FAIL"
         )
 
+        PREDICTIONS.labels(
+            result="success"
+        ).inc()
+
         logger.info(
             "event=prediction_success prediction=%s",
             prediction,
@@ -239,6 +314,11 @@ def predict():
         }), 200
 
     except FileNotFoundError:
+
+        PREDICTIONS.labels(
+            result="error"
+        ).inc()
+
         logger.exception(
             "event=prediction_failed reason=model_not_found"
         )
@@ -248,6 +328,11 @@ def predict():
         }), 500
 
     except (TypeError, ValueError):
+
+        PREDICTIONS.labels(
+            result="error"
+        ).inc()
+
         logger.warning(
             "event=validation_error reason=non_numeric_input"
         )
@@ -257,6 +342,11 @@ def predict():
         }), 400
 
     except Exception:
+
+        PREDICTIONS.labels(
+            result="error"
+        ).inc()
+
         logger.exception(
             "event=prediction_failed"
         )
@@ -276,7 +366,7 @@ if __name__ == "__main__":
         "event=application_starting service=student-result-prediction"
     )
 
-    port = int(__import__("os").environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5000))
 
     app.run(
         host="0.0.0.0",
